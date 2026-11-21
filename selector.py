@@ -361,6 +361,9 @@ class Selector:
                         break
                     if f'lookup:{word}' in self.operands:
                         unknown, values = self.operands[f'lookup:{word}']
+                        if unknown in self.initialization or any(group in self.initialization for _, group in values):
+                            readers.update(tests)
+                            break
                         unchanged = set()
                         affected = set(self.groups[unknown])
                         for value, group in values:
