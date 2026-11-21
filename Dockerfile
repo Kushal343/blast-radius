@@ -10,10 +10,7 @@ RUN mkdir /app/source && tar -xzf /tmp/sqlglot.tar.gz --strip-components=1 -C /a
 COPY requirements.txt /app/
 RUN python -m pip install --disable-pip-version-check --no-cache-dir --prefix=/install -r requirements.txt
 
-ENV PYTHONPATH=/install/lib/python3.13/site-packages
-COPY collect.py comparisons.py operands.py replay_cache.py mapflow.py dispatch.py branches.py /app/
-RUN python -m compileall -q /app/source/sqlglot /app/source/tests \
-    && python /app/collect.py /app/source /app/coverage.json.gz
+RUN python -m compileall -q /app/source/sqlglot /app/source/tests
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 \
@@ -21,7 +18,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 \
 WORKDIR /app
 COPY --from=build /install/ /usr/local/
 COPY --from=build /app/source/ /app/source/
-COPY --from=build /app/coverage.json.gz /app/
+COPY coverage.json.gz /app/
 COPY selector.py patches.py probe.py comparisons.py operands.py replay_cache.py mapflow.py declarations.py dispatch.py branches.py /app/
 USER 65534:65534
 ENTRYPOINT ["python", "/app/selector.py"]
