@@ -12,7 +12,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from comparisons import equality_edits
+from comparisons import equality_edits, site_for
+from mapflow import dict_value_edits
+from operands import edited_predicates, same_result, unpack
 from patches import read_patch
 
 
@@ -102,6 +104,11 @@ class Selector:
         self.dialects = artifact['dialects']
         self.symbol_groups = artifact.get('symbols')
         self.comparisons = artifact.get('comparisons', {})
+        self.operands = artifact.get('operands', {})
+        self.dictionary_values = artifact.get('dictionary_values', {})
+        self.checkpoints = artifact.get('executor_checkpoints', {})
+        self.executor_lines = {name: {path: set(lines) for path, lines in files.items()}
+                               for name, files in artifact.get('executor_lines', {}).items()}
         self.external = {self.by_name[name] for name in artifact['external'] if name in self.by_name}
         self.unmeasured = {number for name, number in self.by_name.items()
                            if artifact['status'].get(name) != 'passed'}
@@ -186,7 +193,7 @@ class Selector:
         return {number for number in self.by_file[path]
                 if (test_id := self.catalog[number]['id']) == prefix or test_id.startswith(prefix + '[')}
 
-    def python_tests(self, change, replacements, equality_sites):
+    def python_tests(self, change, replacements, equality_sites, predicates, body_edits, dictionaries):
         path = change.path
         if change.before != change.after or not change.hunks:
             return self.by_file[path] if path in self.by_file else self.all
@@ -209,10 +216,16 @@ class Selector:
         replacements[path] = after
         if self.comparisons and path.startswith('sqlglot/'):
             equality_sites[path] = equality_edits(path, old_tree, new_tree)
+        if self.operands and path.startswith('sqlglot/'):
+            predicates[path] = edited_predicates(path, old_tree, new_tree, site_for)
 
         new_index = statements_by_line(new_tree)
+        if any(name.lower() in self.dictionary_values for line in removed if line in old_index
+               for name in bindings(old_index[line].node)):
+            dictionaries[path] = dict_value_edits(old_tree, new_tree)
         tests = set(direct_readers)
         initialization = set()
+        affected_lines = set()
         for line in removed:
             stmt = old_index.get(line)
             if stmt is None:
@@ -230,6 +243,7 @@ class Selector:
                     run_lines.add(condition.lineno)
             elif isinstance(stmt.node, ast.Return) and isinstance(stmt.node.value, ast.BoolOp):
                 run_lines.add(stmt.node.value.lineno)
+            affected_lines.update(run_lines)
             covered, during_import = self.line_tests(path, run_lines)
             tests.update(covered)
             if during_import:
@@ -261,12 +275,33 @@ class Selector:
             tests.update(self.initial_tests(path, old, new))
             if tests == self.all:
                 break
+        if (self.checkpoints and not initialization and not inserts and removed and added
+                and path.startswith(('sqlglot/optimizer/', 'sqlglot/parsers/',
+                                     'sqlglot/generators/', 'sqlglot/typing/'))):
+            old_scopes = self.runtime_scopes(old_index, removed)
+            new_scopes = self.runtime_scopes(new_index, added)
+            if old_scopes and old_scopes == new_scopes:
+                body_edits[path] = affected_lines
         return tests | self.unmeasured
+
+    @staticmethod
+    def runtime_scopes(index, changed):
+        scopes = set()
+        for line in changed:
+            stmt = index.get(line)
+            if (not stmt or not stmt.functions or not stmt.runtime
+                    or isinstance(stmt.node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal))):
+                return set()
+            scopes.add((stmt.classes, stmt.functions))
+        return scopes
 
     def select(self, patch):
         tests = set()
         replacements = {}
         equality_sites = {}
+        predicates = {}
+        body_edits = {}
+        dictionaries = {}
         can_probe = True
         try:
             for change in read_patch(patch.read_text(encoding='utf-8')):
@@ -284,28 +319,99 @@ class Selector:
                         prefix = path.removesuffix('conftest.py')
                         tests.update(number for number, t in self.catalog.items() if t['file'].startswith(prefix))
                 if change.path and change.path.endswith('.py') and change.path.startswith(('sqlglot/', 'tests/')):
-                    tests.update(self.python_tests(change, replacements, equality_sites))
+                    tests.update(self.python_tests(change, replacements, equality_sites, predicates,
+                                                   body_edits, dictionaries))
         except (OSError, UnicodeError, SyntaxError, ValueError) as error:
             print(f'{patch.name}: {error}', file=sys.stderr)
-            return self.all, {}
-        if can_probe and len(replacements) == 1 and equality_sites:
-            path, sites = next(iter(equality_sites.items()))
-            if sites and sites <= self.comparisons.keys():
-                safe = tests.copy()
-                for site in sites:
-                    kept, uncertain = self.comparisons[site]
-                    if kept in self.initialization or uncertain in self.initialization:
+            return self.all, {}, {}
+        if can_probe and len(replacements) == 1:
+            path = next(iter(replacements))
+            safe = self.unchanged_comparisons(tests, equality_sites.get(path), predicates.get(path))
+            protected = self.unmeasured | self.external | self.file_tests(path)
+            tests.difference_update(safe - protected)
+            words = dictionaries.get(path)
+            if words and words.keys() <= self.dictionary_values.keys():
+                readers = set()
+                for word, keys in words.items():
+                    uses = set()
+                    boot = False
+                    for module, lines in self.dictionary_values[word].items():
+                        observed, initial = self.line_tests(module, lines)
+                        boot |= initial
+                        uses.update(observed)
+                    if boot:
+                        readers.update(tests)
                         break
-                    safe.intersection_update(self.groups[kept] - self.groups[uncertain])
-                else:
-                    protected = self.unmeasured | self.external | self.file_tests(path)
-                    tests.difference_update(safe - protected)
-        return tests, replacements if can_probe else {}
+                    if f'lookup:{word}' in self.operands:
+                        unknown, values = self.operands[f'lookup:{word}']
+                        unchanged = set()
+                        affected = set(self.groups[unknown])
+                        for value, group in values:
+                            (affected if unpack(value) in keys else unchanged).update(self.groups[group])
+                        uses.difference_update(unchanged - affected)
+                    readers.update(uses)
+                tests.intersection_update(readers | protected)
+        if not can_probe:
+            return tests, {}, {}
+        return tests, replacements, body_edits if body_edits.keys() == replacements.keys() else {}
 
-    def refine(self, tests, replacements, durations):
+    def unchanged_comparisons(self, tests, identity, predicates):
+        safe = tests.copy()
+        if identity and identity <= self.comparisons.keys():
+            for site in identity:
+                equivalent, uncertain = self.comparisons[site]
+                if equivalent in self.initialization or uncertain in self.initialization:
+                    return set()
+                safe.intersection_update(self.groups[equivalent] - self.groups[uncertain])
+            return safe
+        if not predicates or not predicates.keys() <= self.operands.keys():
+            return set()
+        for site, (before, after) in predicates.items():
+            unknown, values = self.operands[site]
+            different = set(self.groups[unknown])
+            equivalent = set()
+            if unknown in self.initialization:
+                return set()
+            for value, group in values:
+                if group in self.initialization:
+                    return set()
+                (equivalent if same_result(value, before, after) else different).update(self.groups[group])
+            safe.intersection_update(equivalent - different)
+        return safe
+
+    def run_probe(self, replacements, names, timeout, checkpoints=None):
+        request = json.dumps({'files': replacements, 'tests': names, 'checkpoints': checkpoints})
+        try:
+            process = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name('probe.py')), str(self.root)],
+                input=request, encoding='utf-8', stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=timeout, check=True,
+            )
+            result = json.loads(process.stdout)
+            self.probe_cpu += result['cpu_seconds']
+            return {self.by_name[name] for name in result['passed'] if name in self.by_name}
+        except subprocess.TimeoutExpired:
+            # Windows has no RUSAGE_CHILDREN. Charge the timeout conservatively there.
+            self.probe_cpu += timeout
+            return set()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return set()
+
+    def refine(self, tests, replacements, durations, body_edits):
         remaining = self.probe_deadline - time.monotonic()
         if not tests or not replacements or remaining < 1:
             return tests
+        if body_edits and remaining > 4:
+            cache = {name: self.checkpoints[name] for name, footprint in self.executor_lines.items()
+                     if self.by_name.get(name) in tests and name in self.checkpoints
+                     and self.by_name[name] not in self.unmeasured
+                     and all(not footprint.get(path, set()) & lines for path, lines in body_edits.items())}
+            eligible = {self.by_name[name] for name in cache}
+            if eligible and scheduled_cost(tests, durations) - scheduled_cost(tests - eligible, durations) > 7500:
+                tests = tests - (eligible & self.run_probe(replacements, sorted(cache), min(7, remaining), cache))
+                remaining = self.probe_deadline - time.monotonic()
+                if remaining < 1:
+                    return tests
         protected = self.external | self.unmeasured | self.symbol_tests('ProcessPoolExecutor')
         protected.update(*(self.file_tests(path) for path in replacements))
         candidates = tests - protected
@@ -318,19 +424,7 @@ class Selector:
             if savings <= expected + 250:
                 return tests
         names = [self.catalog[number]['id'] for number in sorted(candidates)]
-        request = json.dumps({'files': replacements, 'tests': names})
-        try:
-            process = subprocess.run(
-                [sys.executable, str(Path(__file__).with_name('probe.py')), str(self.root)],
-                input=request, encoding='utf-8', stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=min(4, remaining), check=True,
-            )
-            result = json.loads(process.stdout)
-            self.probe_cpu += result['cpu_seconds']
-            passed = result['passed']
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return tests
-        return tests - (candidates & {self.by_name[name] for name in passed if name in self.by_name})
+        return tests - (candidates & self.run_probe(replacements, names, min(4, remaining)))
 
 
 def schedule(numbers, durations):
@@ -377,9 +471,9 @@ def main():
     selector = Selector(catalog, artifact, args.source.resolve())
     durations = {test['number']: round(test['seconds'] * 1000) for test in catalog}
     for patch in sorted((args.data / 'commits').glob('*.patch')):
-        numbers, replacements = selector.select(patch)
+        numbers, replacements, body_edits = selector.select(patch)
         if not args.coverage_only:
-            numbers = selector.refine(numbers, replacements, durations)
+            numbers = selector.refine(numbers, replacements, durations, body_edits)
         workers = schedule(numbers, durations)
         print(json.dumps({'commit': patch.stem, 'workers': workers}, separators=(',', ':')))
     if args.report_cpu:

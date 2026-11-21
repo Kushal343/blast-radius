@@ -2,13 +2,13 @@
 
 This entry selects and schedules SQLGlot regression tests for the RWX Blast Radius challenge. It builds a dependency map by running the pinned SQLGlot revision with line tracing, fixture-read tracing, and dialect tracking. The map uses pytest node IDs so each run can match the test numbers in its own catalog.
 
-The selector applies each diff to the pinned source in memory. Changes inside functions use line coverage and enclosing control flow. Changes to fixtures use recorded file reads. Initialization changes use observed dialect families and references to the affected names, with full-suite fallbacks for changes whose effect cannot be localized. For simple identity-to-equality edits, the selector can omit tests whose baseline operands produced the same result on every observed call with side-effect-free equality.
+The selector applies each diff to the pinned source in memory. Changes inside functions use line coverage and enclosing control flow. Changes to fixtures use recorded file reads. Initialization changes use observed dialect families and references to the affected names, with full-suite fallbacks for changes whose effect cannot be localized. For supported predicate edits, the selector compares the new predicate against baseline operands. For literal dictionary value edits with auditable data flow, it follows the observed readers and lookup keys.
 
-When the potential savings justify replay, an isolated Python process reruns a small set of compatible `unittest` cases with the patched library modules in memory. Tests stay selected if the rerun reports a failure, a failed subtest, a skip, or an incomplete result. Replay has per-patch and batch time limits. The scheduler compares worker counts from one to eight using integer milliseconds and includes each worker’s two-second overhead.
+When the potential savings justify replay, an isolated Python process reruns a small set of compatible `unittest` cases with the patched library modules in memory. For eligible executor tests, replay compares regenerated execution plans and reference SQL for the unchanged fixture inputs. Any changed plan, affected executor code, or incomplete result keeps the test selected. Replay has per-patch and batch time limits. The scheduler compares worker counts from one to eight using integer milliseconds and includes each worker’s two-second overhead.
 
 ## Local benchmark
 
-The official scorer reported 113.641 simulated seconds and zero misses on all 30 sample commits in three consecutive runs. The median rose to 119.5 seconds after adding measured Windows CPU time. The default Docker build regenerates the map from the pinned revision in the scorer’s Linux base image. The bundled map supports local development.
+The default Docker build regenerates all profiles from the pinned revision in the scorer’s Linux base image. The bundled map supports local development. The selector reads only the patch and test catalog inputs during scoring.
 
 ## Build and run the sample
 

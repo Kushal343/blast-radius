@@ -5,17 +5,18 @@ import gzip
 import importlib.machinery
 import json
 import os
-import pickle
 import re
 import sys
 from collections import defaultdict
-from concurrent.futures import Future
 from functools import lru_cache
 from pathlib import Path
 
 import pytest
 
 from comparisons import eligible, site_for
+from mapflow import find_flows, spelling
+from operands import NO_VALUE, describe, pack
+from replay_cache import EXECUTOR_TESTS, InlineExecutor, checkpoint_key, digest
 
 
 class LineTrace:
@@ -73,6 +74,54 @@ class Dependencies:
         self.external = set()
         self.status = {}
         self.collection_errors = []
+        self.checkpoints = defaultdict(set)
+        self.reference_sql = defaultdict(dict)
+
+    def trace_executor(self):
+        from sqlglot.executor.python import PythonExecutor
+        from tests import test_executor
+
+        original_init = PythonExecutor.__init__
+        original_execute = PythonExecutor.execute
+        original_transpile = test_executor.transpile
+
+        def traced_init(executor, *args, **kwargs):
+            context = self.tracer.context
+            if context not in EXECUTOR_TESTS:
+                return original_init(executor, *args, **kwargs)
+            self.tracer.switch_context('executor:' + context)
+            try:
+                return original_init(executor, *args, **kwargs)
+            finally:
+                self.tracer.switch_context(context)
+
+        def traced_execute(executor, plan, outer_scope=None):
+            context = self.tracer.context
+            if context not in EXECUTOR_TESTS or outer_scope is not None:
+                return original_execute(executor, plan, outer_scope)
+            self.tracer.switch_context('checkpoint-metadata')
+            try:
+                key = checkpoint_key(executor, plan)
+            except (ValueError, TypeError, AttributeError, RecursionError):
+                key = None
+            self.tracer.switch_context('executor:' + context)
+            try:
+                table = original_execute(executor, plan, outer_scope)
+                if key is not None:
+                    self.checkpoints[context].add(key)
+                return table
+            finally:
+                self.tracer.switch_context(context)
+
+        def traced_transpile(sql, *args, **kwargs):
+            result = original_transpile(sql, *args, **kwargs)
+            if self.tracer.context in EXECUTOR_TESTS and kwargs.get('write') == 'duckdb':
+                self.reference_sql[self.tracer.context][digest(sql)] = digest(result[0])
+            return result
+
+        PythonExecutor.__init__ = traced_init
+        PythonExecutor.execute = traced_execute
+        test_executor.transpile = traced_transpile
 
     def pytest_sessionstart(self, session):
         from sqlglot.dialects.dialect import Dialect
@@ -80,8 +129,9 @@ class Dependencies:
 
         # Run executor jobs in the traced process so their lines are associated
         # with the owning pytest item, including jobs using the spawn context.
-        test_executor.ProcessPoolExecutor = TracedExecutor
-        test_optimizer.ProcessPoolExecutor = TracedExecutor
+        test_executor.ProcessPoolExecutor = InlineExecutor
+        test_optimizer.ProcessPoolExecutor = InlineExecutor
+        self.trace_executor()
 
         original = Dialect.get_or_raise.__func__
         families = {}
@@ -160,38 +210,43 @@ class Dependencies:
             self.collection_errors.append(report.nodeid)
 
 
-class TracedExecutor:
-    def __init__(self, *, mp_context, initializer=None, initargs=()):
-        if initializer is not None:
-            initializer(*initargs)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exception):
-        return False
-
-    def shutdown(self):
-        pass
-
-    def submit(self, task, *args, **kwargs):
-        result = Future()
-        try:
-            task, args, kwargs = pickle.loads(pickle.dumps((task, args, kwargs)))
-            value = pickle.loads(pickle.dumps(task(*args, **kwargs)))
-            result.set_result(value)
-        except Exception as error:
-            result.set_exception(error)
-        return result
-
-
 class ComparisonTransform(ast.NodeTransformer):
-    def __init__(self, path):
+    def __init__(self, path, lookups):
         self.path = path
+        self.lookups = lookups
         self.changed = False
+
+    def watch(self, key, operand):
+        self.changed = True
+        return ast.copy_location(ast.Call(ast.Name('_blast_observe_operand', ast.Load()),
+                                         [ast.Constant(key), operand], []), operand)
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        function = node.func
+        if isinstance(function, ast.Attribute) and function.attr == 'get' and node.args:
+            word = spelling(function.value)
+            if word in self.lookups and not isinstance(node.args[0], ast.Starred):
+                node.args[0] = self.watch('lookup:' + word, node.args[0])
+        return node
+
+    def visit_Subscript(self, node):
+        self.generic_visit(node)
+        word = spelling(node.value)
+        if word in self.lookups and isinstance(node.ctx, ast.Load) and not isinstance(node.slice, ast.Slice):
+            node.slice = self.watch('lookup:' + word, node.slice)
+        return node
 
     def visit_Compare(self, node):
         self.generic_visit(node)
+        if description := describe(node):
+            position, operand, _, _ = description
+            watch = self.watch(site_for(self.path, node), operand)
+            if position == 0:
+                node.left = watch
+            else:
+                node.comparators[0] = watch
+            return node
         if not eligible(node):
             return node
         self.changed = True
@@ -202,20 +257,21 @@ class ComparisonTransform(ast.NodeTransformer):
 
 
 class ComparisonSource(importlib.machinery.SourceFileLoader):
-    def __init__(self, original, path, observe):
+    def __init__(self, original, path, observers, lookups):
         super().__init__(original.name, original.path)
         self.relative_path = path
-        self.observe = observe
+        self.observers = observers
+        self.lookups = lookups
 
     def exec_module(self, module):
-        module.__dict__['_blast_sample_compare'] = self.observe
+        module.__dict__.update(self.observers)
         super().exec_module(module)
 
     def get_code(self, fullname):
         data = self.get_data(self.path)
-        if b'self.' in data and b' is ' in data:
+        if self.lookups or any(op in data for op in (b' is ', b'==', b'!=', b'<', b'>', b' in ')):
             tree = ast.parse(data, self.path)
-            transformer = ComparisonTransform(self.relative_path)
+            transformer = ComparisonTransform(self.relative_path, self.lookups)
             transformer.visit(tree)
             if transformer.changed:
                 return compile(ast.fix_missing_locations(tree), self.path, 'exec', dont_inherit=True)
@@ -223,9 +279,17 @@ class ComparisonSource(importlib.machinery.SourceFileLoader):
 
 
 class ComparisonFinder(importlib.machinery.PathFinder):
-    def __init__(self, tracer):
+    def __init__(self, tracer, flows):
         self.tracer = tracer
         self.observations = defaultdict(dict)
+        self.operands = defaultdict(dict)
+        self.flows = flows
+        self.lookups = defaultdict(set)
+        for word, paths in flows.items():
+            for path in paths:
+                self.lookups[path].add(word)
+        self.observers = {'_blast_sample_compare': self.observe,
+                          '_blast_observe_operand': self.observe_operand}
 
     def find_spec(self, fullname, path=None, target=None):
         if fullname != 'sqlglot' and not fullname.startswith('sqlglot.'):
@@ -234,7 +298,7 @@ class ComparisonFinder(importlib.machinery.PathFinder):
         if spec and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
             relative = self.tracer.relative(spec.origin)
             if relative:
-                spec.loader = ComparisonSource(spec.loader, relative, self.observe)
+                spec.loader = ComparisonSource(spec.loader, relative, self.observers, self.lookups.get(relative, ()))
         return spec
 
     def observe(self, site, left, right, inverted):
@@ -249,6 +313,23 @@ class ComparisonFinder(importlib.machinery.PathFinder):
                 safe = new_result is old_result
             contexts[context] = safe
         return old_result
+
+    def observe_operand(self, site, value):
+        contexts = self.operands[site]
+        context = self.tracer.context
+        members = contexts.get(context, NO_VALUE)
+        if members is None:
+            return value
+        datum = pack(value)
+        if datum is NO_VALUE:
+            contexts[context] = None
+        elif members is NO_VALUE:
+            contexts[context] = {datum}
+        else:
+            members.add(datum)
+            if len(members) > 32:
+                contexts[context] = None
+        return value
 
 
 @lru_cache(maxsize=None)
@@ -274,7 +355,7 @@ def symbol_groups(root, files):
     return {token: sorted(ids) for token, ids in groups.items()}
 
 
-def save_map(output, tracer, plugin, comparisons):
+def save_map(output, tracer, plugin, finder):
     tests = sorted(set(plugin.status) | {''})
     ids = {name: number for number, name in enumerate(tests)}
     setups = defaultdict(list)
@@ -284,16 +365,30 @@ def save_map(output, tracer, plugin, comparisons):
     group_ids = {}
 
     def group(names):
-        expanded = {item for name in names for item in setups.get(name, [name])}
+        expanded = {item.removeprefix('executor:') for name in names for item in setups.get(name, [name])}
         members = tuple(sorted(ids[n] for n in expanded if n in ids))
         if members not in group_ids:
             group_ids[members] = len(groups)
             groups.append(members)
         return group_ids[members]
 
-    lines = {path: {line: group(names) for line, names in sorted(points.items())}
+    lines = {path: {line: group(names) for line, names in sorted(points.items())
+                    if names - {'checkpoint-metadata'}}
              for path, points in sorted(tracer.hits.items())}
 
+    def operand_groups(contexts):
+        by_value = defaultdict(set)
+        unknown = set()
+        for name, values in contexts.items():
+            if values is None:
+                unknown.add(name)
+                continue
+            for value in values:
+                by_value[value].add(name)
+        return [group(unknown), [(value, group(names)) for value, names in
+                                 sorted(by_value.items(), key=lambda item: repr(item[0]))]]
+
+    executor_tests = EXECUTOR_TESTS & plugin.status.keys()
     artifact = {
         'tests': tests,
         'groups': groups,
@@ -306,7 +401,16 @@ def save_map(output, tracer, plugin, comparisons):
         'symbols': symbol_groups(Path.cwd(), lines),
         'comparisons': {site: [group(name for name, safe in contexts.items() if safe),
                                group(name for name, safe in contexts.items() if not safe)]
-                        for site, contexts in sorted(comparisons.items())},
+                        for site, contexts in sorted(finder.observations.items())},
+        'operands': {site: operand_groups(contexts) for site, contexts in sorted(finder.operands.items())},
+        'dictionary_values': finder.flows,
+        'executor_checkpoints': {name: {'plans': sorted(plugin.checkpoints[name]),
+                                       'reference_sql': plugin.reference_sql[name]}
+                                 for name in sorted(executor_tests)},
+        'executor_lines': {test: {path: matches for path, points in sorted(tracer.hits.items())
+                                  if (matches := sorted(line for line, names in points.items()
+                                                       if 'executor:' + test in names))}
+                           for test in sorted(executor_tests)},
     }
     payload = json.dumps(artifact, separators=(',', ':'), sort_keys=True).encode()
     output.write_bytes(gzip.compress(payload, compresslevel=6, mtime=0))
@@ -321,7 +425,7 @@ def main():
     sys.path.insert(0, str(root))
     os.environ.update(SKIP_INTEGRATION='0', PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
     tracer = LineTrace(root)
-    comparison_finder = ComparisonFinder(tracer)
+    comparison_finder = ComparisonFinder(tracer, find_flows(root))
     sys.meta_path.insert(0, comparison_finder)
     plugin = Dependencies(root, tracer)
     sys.addaudithook(plugin.audit)
@@ -331,7 +435,7 @@ def main():
     tracer.stop()
     if int(result) not in (0, 1) or not plugin.status:
         raise SystemExit(f'Coverage collection did not finish: pytest exit {result}')
-    save_map(output, tracer, plugin, comparison_finder.observations)
+    save_map(output, tracer, plugin, comparison_finder)
 
 
 if __name__ == '__main__':
