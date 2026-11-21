@@ -10,7 +10,7 @@ The build also measures which tests enter individual conditional operands, invok
 
 ## Local benchmark
 
-The default Docker build regenerates all profiles from the pinned revision in the scorer’s Linux base image. The bundled map supports local development. The selector reads only the patch and test catalog inputs during scoring.
+The default Docker build uses the committed Linux profile. It was generated from the pinned revision in the scorer’s Python image. The collector remains in this repository so the profile can be regenerated. The selector reads only the patch and test catalog inputs during scoring.
 
 ## Build and run the sample
 
