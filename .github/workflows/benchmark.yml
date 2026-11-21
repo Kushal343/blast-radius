@@ -15,6 +15,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build the submission image
         run: timeout 570 docker build --platform linux/amd64 --progress=plain -t blast-radius .
+      - name: Export the pinned revision's Linux profile
+        run: |
+          container=$(docker create blast-radius)
+          docker cp "$container:/app/coverage.json.gz" coverage-linux.json.gz
+          docker rm "$container"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-baseline
+          path: coverage-linux.json.gz
+          retention-days: 3
       - name: Score three runs with contest limits
         shell: bash
         run: |
