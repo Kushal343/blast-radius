@@ -81,7 +81,7 @@ class Dependencies:
         self.external = set()
         self.status = {}
         self.collection_errors = []
-        self.checkpoints = defaultdict(set)
+        self.checkpoints = defaultdict(lambda: defaultdict(set))
         self.reference_sql = defaultdict(dict)
 
     def trace_executor(self):
@@ -145,8 +145,8 @@ class Dependencies:
 
         def traced_execute(executor, plan, outer_scope=None):
             context = self.tracer.context
-            test, _ = case_of(context)
-            if test not in EXECUTOR_TESTS or outer_scope is not None:
+            test, index = case_of(context)
+            if test not in EXECUTOR_TESTS or index is None or outer_scope is not None:
                 return original_execute(executor, plan, outer_scope)
             self.tracer.switch_context('checkpoint-metadata')
             try:
@@ -157,7 +157,7 @@ class Dependencies:
             try:
                 table = original_execute(executor, plan, outer_scope)
                 if key is not None:
-                    self.checkpoints[test].add(key)
+                    self.checkpoints[test][index].add(key)
                 return table
             finally:
                 self.tracer.switch_context(context)
@@ -480,7 +480,7 @@ def save_map(output, tracer, plugin, finder):
                         for site, contexts in sorted(finder.observations.items())},
         'operands': {site: operand_groups(contexts) for site, contexts in sorted(finder.operands.items())},
         'dictionary_values': finder.flows,
-        'executor_checkpoints': {name: {'plans': sorted(plugin.checkpoints[name]),
+        'executor_checkpoints': {name: {'plans': {index: sorted(keys) for index, keys in plugin.checkpoints[name].items()},
                                        'reference_sql': plugin.reference_sql[name]}
                                  for name in sorted(executor_tests)},
         'executor_lines': executor_lines,

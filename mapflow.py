@@ -91,10 +91,12 @@ def find_flows(root):
                 continue
             if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr == 'get':
                 call = parents.get(parent)
-                if isinstance(call, ast.Call) and call.func is parent and call.args:
+                if (isinstance(call, ast.Call) and call.func is parent and call.args
+                        and not isinstance(call.args[0], ast.Starred)):
                     value_reads[word][path].update(range(call.lineno, call.end_lineno + 1))
                     continue
-            if isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
+            if (isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load)
+                    and not isinstance(parent.slice, ast.Slice)):
                 value_reads[word][path].update(range(parent.lineno, parent.end_lineno + 1))
                 continue
             if (isinstance(parent, ast.Compare) and len(parent.ops) == 1

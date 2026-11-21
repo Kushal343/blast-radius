@@ -103,12 +103,32 @@ def use_checkpoints(checkpoints, results):
     from tests import test_executor
 
     ordinary = PythonExecutor.execute
+    active_index = None
+
+    class IndexedReplay(InlineExecutor):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.next_index = 0
+
+        def submit(self, task, *args, **kwargs):
+            nonlocal active_index
+            entries = checkpoints.get(results.current)
+            if entries is None:
+                return super().submit(task, *args, **kwargs)
+            selected = entries.get('cases')
+            active_index = self.next_index if selected is None else selected[self.next_index]
+            self.next_index += 1
+            try:
+                return super().submit(task, *args, **kwargs)
+            finally:
+                active_index = None
 
     def cached(executor, plan, outer_scope=None):
         entries = checkpoints.get(results.current)
         if entries is None:
             return ordinary(executor, plan, outer_scope)
-        if outer_scope is not None or checkpoint_key(executor, plan) not in entries['plans']:
+        expected = entries['plans'].get(str(active_index), ())
+        if outer_scope is not None or checkpoint_key(executor, plan) not in expected:
             raise UnmatchedCheckpoint('changed executor inputs require the original test')
         return True
 
@@ -131,7 +151,7 @@ def use_checkpoints(checkpoints, results):
         if table is not True or reference != digest(rendering):
             raise UnmatchedCheckpoint('changed reference SQL requires the original test')
 
-    test_executor.ProcessPoolExecutor = InlineExecutor
+    test_executor.ProcessPoolExecutor = IndexedReplay
     test_executor.TestExecutor.setUpClass = classmethod(setup)
     test_executor.TestExecutor.tearDownClass = classmethod(lambda cls: None)
     test_executor.TestExecutor.subtestHelper = check
