@@ -22,6 +22,6 @@ WORKDIR /app
 COPY --from=build /install/ /usr/local/
 COPY --from=build /app/source/ /app/source/
 COPY --from=build /app/coverage.json.gz /app/
-COPY selector.py patches.py probe.py comparisons.py operands.py replay_cache.py mapflow.py /app/
+COPY selector.py patches.py probe.py comparisons.py operands.py replay_cache.py mapflow.py declarations.py /app/
 USER 65534:65534
 ENTRYPOINT ["python", "/app/selector.py"]

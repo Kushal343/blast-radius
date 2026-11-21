@@ -4,7 +4,7 @@ This entry selects and schedules SQLGlot regression tests for the RWX Blast Radi
 
 The selector applies each diff to the pinned source in memory. Changes inside functions use line coverage and enclosing control flow. Changes to fixtures use recorded file reads. Initialization changes use observed dialect families and references to the affected names, with full-suite fallbacks for changes whose effect cannot be localized. For supported predicate edits, the selector compares the new predicate against baseline operands. For literal dictionary value edits with auditable data flow, it follows the observed readers and lookup keys.
 
-When the potential savings justify replay, an isolated Python process reruns a small set of compatible `unittest` cases with the patched library modules in memory. For eligible executor tests, replay compares regenerated execution plans and reference SQL for the unchanged fixture inputs. Any changed plan, affected executor code, or incomplete result keeps the test selected. Replay has per-patch and batch time limits. The scheduler compares worker counts from one to eight using integer milliseconds and includes each worker’s two-second overhead.
+When the potential savings justify replay, an isolated Python process reruns a small set of compatible `unittest` cases with the patched library modules in memory. For eligible executor tests, replay compares regenerated execution plans and reference SQL for the affected queries on unchanged fixture inputs. Any changed plan, affected executor code, or incomplete result keeps the test selected. Replay has per-patch and batch time limits. The scheduler compares worker counts from one to eight using integer milliseconds and includes each worker’s two-second overhead.
 
 ## Local benchmark
 

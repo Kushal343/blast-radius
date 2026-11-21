@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from comparisons import equality_edits, site_for
+from declarations import default_edits
 from mapflow import dict_value_edits
 from operands import edited_predicates, same_result, unpack
 from patches import read_patch
@@ -109,6 +110,9 @@ class Selector:
         self.checkpoints = artifact.get('executor_checkpoints', {})
         self.executor_lines = {name: {path: set(lines) for path, lines in files.items()}
                                for name, files in artifact.get('executor_lines', {}).items()}
+        self.executor_cases = artifact.get('executor_cases', {})
+        self.executor_shared = {name: {path: set(lines) for path, lines in files.items()}
+                                for name, files in artifact.get('executor_shared', {}).items()}
         self.external = {self.by_name[name] for name in artifact['external'] if name in self.by_name}
         self.unmeasured = {number for name, number in self.by_name.items()
                            if artifact['status'].get(name) != 'passed'}
@@ -220,6 +224,19 @@ class Selector:
             predicates[path] = edited_predicates(path, old_tree, new_tree, site_for)
 
         new_index = statements_by_line(new_tree)
+        if path.startswith('sqlglot/') and any(isinstance(old_index[line].node, FUNCTIONS)
+                                                for line in removed if line in old_index):
+            defaults = default_edits(old_tree, new_tree)
+            if defaults:
+                calls = set(direct_readers) | self.unmeasured | self.external
+                during_import = False
+                for function in defaults:
+                    lines = range(function.body[0].lineno, function.end_lineno + 1)
+                    covered, initial = self.line_tests(path, lines)
+                    calls.update(covered | self.symbol_tests(function.name))
+                    during_import |= initial
+                if not during_import:
+                    return calls
         if any(name.lower() in self.dictionary_values for line in removed if line in old_index
                for name in bindings(old_index[line].node)):
             dictionaries[path] = dict_value_edits(old_tree, new_tree)
@@ -397,26 +414,44 @@ class Selector:
         except (OSError, ValueError, subprocess.SubprocessError):
             return set()
 
+    def eligible_executor_cases(self, tests, body_edits):
+        cache = {}
+        for name, paths in self.executor_cases.items():
+            number = self.by_name.get(name)
+            if number not in tests or number in self.unmeasured or name not in self.checkpoints:
+                continue
+            executor = self.executor_lines.get(name, {})
+            shared = self.executor_shared.get(name, {})
+            if any((executor.get(path, set()) | shared.get(path, set())) & lines
+                   for path, lines in body_edits.items()):
+                continue
+            indices = {index for path, lines in body_edits.items() for line in lines
+                       for index in paths.get(path, {}).get(str(line), ())}
+            if 0 < len(indices) <= 30:
+                cache[name] = {**self.checkpoints[name], 'cases': sorted(indices)}
+        return cache
+
     def refine(self, tests, replacements, durations, body_edits):
         remaining = self.probe_deadline - time.monotonic()
         if not tests or not replacements or remaining < 1:
             return tests
         if body_edits and remaining > 4:
-            cache = {name: self.checkpoints[name] for name, footprint in self.executor_lines.items()
-                     if self.by_name.get(name) in tests and name in self.checkpoints
-                     and self.by_name[name] not in self.unmeasured
-                     and all(not footprint.get(path, set()) & lines for path, lines in body_edits.items())}
+            cache = self.eligible_executor_cases(tests, body_edits)
             eligible = {self.by_name[name] for name in cache}
-            if eligible and scheduled_cost(tests, durations) - scheduled_cost(tests - eligible, durations) > 7500:
-                tests = tests - (eligible & self.run_probe(replacements, sorted(cache), min(7, remaining), cache))
+            case_count = sum(len(item['cases']) for item in cache.values())
+            if (eligible and scheduled_cost(tests, durations) - scheduled_cost(tests - eligible, durations)
+                    > 2500 + 100 * case_count):
+                names = sorted(cache, key=lambda name: len(cache[name]['cases']))
+                tests = tests - (eligible & self.run_probe(replacements, names, min(5, remaining), cache))
                 remaining = self.probe_deadline - time.monotonic()
                 if remaining < 1:
                     return tests
-        protected = self.external | self.unmeasured | self.symbol_tests('ProcessPoolExecutor')
+        multiprocessing = self.symbol_tests('ProcessPoolExecutor') - self.by_file['tests/test_optimizer.py']
+        protected = self.external | self.unmeasured | multiprocessing
         protected.update(*(self.file_tests(path) for path in replacements))
         candidates = tests - protected
         expected = sum(durations[number] for number in candidates)
-        if len(candidates) < 2 or expected > 1300:
+        if len(candidates) < 2 or expected > 2000:
             return tests
         retained = tests & protected
         if retained:

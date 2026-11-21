@@ -19,6 +19,13 @@ from operands import NO_VALUE, describe, pack
 from replay_cache import EXECUTOR_TESTS, InlineExecutor, checkpoint_key, digest
 
 
+def case_of(context):
+    if context.startswith('case:'):
+        _, index, test = context.split(':', 2)
+        return test, int(index)
+    return context, None
+
+
 class LineTrace:
     """Remember each line once per pytest context, even inside large loops."""
 
@@ -84,10 +91,51 @@ class Dependencies:
         original_init = PythonExecutor.__init__
         original_execute = PythonExecutor.execute
         original_transpile = test_executor.transpile
+        original_parser = test_executor.parse_one
+        original_subtest = test_executor.TestExecutor.subtestHelper
+        parse_counts = defaultdict(int)
+
+        def in_case(test, index, func, *args, **kwargs):
+            context = self.tracer.context
+            self.tracer.switch_context(f'case:{index}:{test}')
+            try:
+                return func(*args, **kwargs)
+            finally:
+                self.tracer.switch_context(context)
+
+        class IndexedExecutor(InlineExecutor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                parse_counts[self_test.current] = 0
+                self.next_index = 0
+
+            def submit(self, task, *args, **kwargs):
+                active = self_test.current
+                if active not in EXECUTOR_TESTS or task is not test_executor.mp_execute:
+                    return super().submit(task, *args, **kwargs)
+                index = self.next_index
+                self.next_index += 1
+                return in_case(active, index, super().submit, task, *args, **kwargs)
+
+        self_test = self
+
+        def traced_parser(*args, **kwargs):
+            test = self.current
+            caller = sys._getframe(1).f_code.co_qualname
+            if test not in EXECUTOR_TESTS or not caller.startswith('TestExecutor._mp_execute'):
+                return original_parser(*args, **kwargs)
+            index = parse_counts[test]
+            parse_counts[test] += 1
+            return in_case(test, index, original_parser, *args, **kwargs)
+
+        def traced_subtest(instance, index, *args, **kwargs):
+            if self.current in EXECUTOR_TESTS:
+                return in_case(self.current, index, original_subtest, instance, index, *args, **kwargs)
+            return original_subtest(instance, index, *args, **kwargs)
 
         def traced_init(executor, *args, **kwargs):
             context = self.tracer.context
-            if context not in EXECUTOR_TESTS:
+            if case_of(context)[0] not in EXECUTOR_TESTS:
                 return original_init(executor, *args, **kwargs)
             self.tracer.switch_context('executor:' + context)
             try:
@@ -97,7 +145,8 @@ class Dependencies:
 
         def traced_execute(executor, plan, outer_scope=None):
             context = self.tracer.context
-            if context not in EXECUTOR_TESTS or outer_scope is not None:
+            test, _ = case_of(context)
+            if test not in EXECUTOR_TESTS or outer_scope is not None:
                 return original_execute(executor, plan, outer_scope)
             self.tracer.switch_context('checkpoint-metadata')
             try:
@@ -108,20 +157,24 @@ class Dependencies:
             try:
                 table = original_execute(executor, plan, outer_scope)
                 if key is not None:
-                    self.checkpoints[context].add(key)
+                    self.checkpoints[test].add(key)
                 return table
             finally:
                 self.tracer.switch_context(context)
 
         def traced_transpile(sql, *args, **kwargs):
             result = original_transpile(sql, *args, **kwargs)
-            if self.tracer.context in EXECUTOR_TESTS and kwargs.get('write') == 'duckdb':
-                self.reference_sql[self.tracer.context][digest(sql)] = digest(result[0])
+            test, _ = case_of(self.tracer.context)
+            if test in EXECUTOR_TESTS and kwargs.get('write') == 'duckdb':
+                self.reference_sql[test][digest(sql)] = digest(result[0])
             return result
 
         PythonExecutor.__init__ = traced_init
         PythonExecutor.execute = traced_execute
+        test_executor.ProcessPoolExecutor = IndexedExecutor
+        test_executor.parse_one = traced_parser
         test_executor.transpile = traced_transpile
+        test_executor.TestExecutor.subtestHelper = traced_subtest
 
     def pytest_sessionstart(self, session):
         from sqlglot.dialects.dialect import Dialect
@@ -129,7 +182,6 @@ class Dependencies:
 
         # Run executor jobs in the traced process so their lines are associated
         # with the owning pytest item, including jobs using the spawn context.
-        test_executor.ProcessPoolExecutor = InlineExecutor
         test_optimizer.ProcessPoolExecutor = InlineExecutor
         self.trace_executor()
 
@@ -365,7 +417,7 @@ def save_map(output, tracer, plugin, finder):
     group_ids = {}
 
     def group(names):
-        expanded = {item.removeprefix('executor:') for name in names for item in setups.get(name, [name])}
+        expanded = {case_of(item.removeprefix('executor:'))[0] for name in names for item in setups.get(name, [name])}
         members = tuple(sorted(ids[n] for n in expanded if n in ids))
         if members not in group_ids:
             group_ids[members] = len(groups)
@@ -389,6 +441,30 @@ def save_map(output, tracer, plugin, finder):
                                  sorted(by_value.items(), key=lambda item: repr(item[0]))]]
 
     executor_tests = EXECUTOR_TESTS & plugin.status.keys()
+    executor_lines = {test: defaultdict(list) for test in executor_tests}
+    case_lines = {test: defaultdict(dict) for test in executor_tests}
+    shared_lines = {test: defaultdict(list) for test in executor_tests}
+    for path, points in sorted(tracer.hits.items()):
+        if not path.startswith('sqlglot/'):
+            continue
+        for line, names in sorted(points.items()):
+            by_test = defaultdict(set)
+            for name in names:
+                executor = name.startswith('executor:')
+                test, index = case_of(name.removeprefix('executor:'))
+                if test in executor_tests:
+                    if executor:
+                        executor_lines[test][path].append(line)
+                    if index is None:
+                        shared_lines[test][path].append(line)
+                    else:
+                        by_test[test].add(index)
+                elif name.startswith('setup:'):
+                    for member in setups.get(name, ()):
+                        if member in executor_tests:
+                            shared_lines[member][path].append(line)
+            for test, indices in by_test.items():
+                case_lines[test][path][line] = sorted(indices)
     artifact = {
         'tests': tests,
         'groups': groups,
@@ -407,10 +483,9 @@ def save_map(output, tracer, plugin, finder):
         'executor_checkpoints': {name: {'plans': sorted(plugin.checkpoints[name]),
                                        'reference_sql': plugin.reference_sql[name]}
                                  for name in sorted(executor_tests)},
-        'executor_lines': {test: {path: matches for path, points in sorted(tracer.hits.items())
-                                  if (matches := sorted(line for line, names in points.items()
-                                                       if 'executor:' + test in names))}
-                           for test in sorted(executor_tests)},
+        'executor_lines': executor_lines,
+        'executor_cases': case_lines,
+        'executor_shared': shared_lines,
     }
     payload = json.dumps(artifact, separators=(',', ':'), sort_keys=True).encode()
     output.write_bytes(gzip.compress(payload, compresslevel=6, mtime=0))
