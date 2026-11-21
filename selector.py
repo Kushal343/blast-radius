@@ -23,6 +23,8 @@ FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 DIALECT_FAMILIES = {'dialects', 'generators', 'parsers', 'typing', 'tokens'}
 CONFIG = {'pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml'}
 BRANCHES = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.Match, ast.With, ast.AsyncWith)
+FRONTEND_MODULES = {'sqlglot/parser.py', 'sqlglot/generator.py', 'sqlglot/tokens.py',
+                    'sqlglot/tokenizer_core.py'}
 
 
 @dataclass(frozen=True)
@@ -292,9 +294,9 @@ class Selector:
             tests.update(self.initial_tests(path, old, new))
             if tests == self.all:
                 break
-        if (self.checkpoints and not initialization and not inserts and removed and added
-                and path.startswith(('sqlglot/optimizer/', 'sqlglot/parsers/',
-                                     'sqlglot/generators/', 'sqlglot/typing/'))):
+        frontend = path in FRONTEND_MODULES or path.startswith((
+            'sqlglot/optimizer/', 'sqlglot/parsers/', 'sqlglot/generators/', 'sqlglot/typing/', 'sqlglot/dialects/'))
+        if self.checkpoints and frontend and not initialization and not inserts and removed and added:
             old_scopes = self.runtime_scopes(old_index, removed)
             new_scopes = self.runtime_scopes(new_index, added)
             if old_scopes and old_scopes == new_scopes:
@@ -376,28 +378,29 @@ class Selector:
         return tests, replacements, body_edits if body_edits.keys() == replacements.keys() else {}
 
     def unchanged_comparisons(self, tests, identity, predicates):
-        safe = tests.copy()
+        affected = set()
         if identity and identity <= self.comparisons.keys():
             for site in identity:
-                equivalent, uncertain = self.comparisons[site]
-                if equivalent in self.initialization or uncertain in self.initialization:
+                _, uncertain = self.comparisons[site]
+                if uncertain in self.initialization:
                     return set()
-                safe.intersection_update(self.groups[equivalent] - self.groups[uncertain])
-            return safe
+                affected.update(self.groups[uncertain])
+            return tests - affected
         if not predicates or not predicates.keys() <= self.operands.keys():
             return set()
         for site, (before, after) in predicates.items():
             unknown, values = self.operands[site]
-            different = set(self.groups[unknown])
-            equivalent = set()
             if unknown in self.initialization:
                 return set()
+            affected.update(self.groups[unknown])
             for value, group in values:
-                if group in self.initialization:
-                    return set()
-                (equivalent if same_result(value, before, after) else different).update(self.groups[group])
-            safe.intersection_update(equivalent - different)
-        return safe
+                if not same_result(value, before, after):
+                    if group in self.initialization:
+                        return set()
+                    affected.update(self.groups[group])
+        # An unvisited predicate cannot introduce a new path by itself. The
+        # structural match above established that the rest of the code is equal.
+        return tests - affected
 
     def run_probe(self, replacements, names, timeout, checkpoints=None):
         request = json.dumps({'files': replacements, 'tests': names, 'checkpoints': checkpoints})
