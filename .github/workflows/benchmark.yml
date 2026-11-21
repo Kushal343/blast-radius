@@ -1,0 +1,42 @@
+name: Blast Radius Linux validation
+
+on:
+  push:
+    branches: [linux-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the submission image
+        run: timeout 570 docker build --platform linux/amd64 --progress=plain -t blast-radius .
+      - name: Score three runs with contest limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/blast-sample
+          curl -fsSL https://www.joinbuilders.org/buildathon/tracks/blast-radius/files/blast-radius-sample.tar.gz |
+            tar xzf - -C /tmp/blast-sample
+          sample=/tmp/blast-sample/sample
+          for number in 1 2 3; do
+            timeout 180 docker run --rm --platform linux/amd64 --network none --cpus 2 \
+              --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+              --volume "$sample/commits:/data/commits:ro" \
+              --volume "$sample/tests.json:/data/tests.json:ro" \
+              blast-radius --report-cpu > "$number.jsonl" 2> "$number.log"
+            cpu=$(sed -n 's/^CPU_SECONDS=//p' "$number.log")
+            test -n "$cpu"
+            python3 /tmp/blast-sample/score.py "$sample" "$sample/answers.json" "$number.jsonl" \
+              --cpu-seconds "$cpu" | tee "$number.score"
+          done
+          grep -H '^Misses:    0 ' ./*.score
+          test "$(grep -l '^Misses:    0 ' ./*.score | wc -l)" -eq 3
+          awk '/^Total:/ { print $2 }' ./*.score | sort -n | sed -n '2p' > median.txt
+          printf 'Sample median: %s seconds\n' "$(cat median.txt)"
