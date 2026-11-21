@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from branches import BranchTransform
 from comparisons import eligible, site_for
+from dispatch import DispatchProfile, DispatchTransform, scalar_inventory
 from mapflow import find_flows, spelling
 from operands import NO_VALUE, describe, pack
 from replay_cache import EXECUTOR_TESTS, InlineExecutor, checkpoint_key, digest
@@ -36,6 +38,17 @@ class LineTrace:
         self.paths = {}
         self.instrumented = {}
         self.hits = defaultdict(lambda: defaultdict(set))
+        self.dispatch = None
+        self.import_depth = 0
+        self.virtual = defaultdict(dict)
+        self.branch_hits = {}
+
+    def virtual_line(self, path, key):
+        by_line = self.virtual[path]
+        number = 100000 + len(by_line)
+        by_line[number] = key
+        self.branch_hits.setdefault(key, set())
+        return number
 
     def relative(self, filename):
         if filename not in self.paths:
@@ -45,13 +58,19 @@ class LineTrace:
         return self.paths[filename]
 
     def entered(self, code, offset):
+        if self.dispatch and (callback := self.dispatch.calls.get(id(code))):
+            self.dispatch.hits[callback[1]].add('' if self.import_depth else self.context)
         if id(code) not in self.instrumented and self.relative(code.co_filename):
             sys.monitoring.set_local_events(self.tool, code, sys.monitoring.events.LINE)
             self.instrumented[id(code)] = code
         return sys.monitoring.DISABLE
 
     def line(self, code, number):
-        self.hits[self.relative(code.co_filename)][number].add(self.context)
+        path = self.relative(code.co_filename)
+        if number >= 100000 and number in self.virtual.get(path, ()):
+            self.branch_hits[self.virtual[path][number]].add('' if self.import_depth else self.context)
+        else:
+            self.hits[path][number].add(self.context)
         return sys.monitoring.DISABLE
 
     def switch_context(self, context):
@@ -263,9 +282,10 @@ class Dependencies:
 
 
 class ComparisonTransform(ast.NodeTransformer):
-    def __init__(self, path, lookups):
+    def __init__(self, path, lookups, scalar_words):
         self.path = path
         self.lookups = lookups
+        self.scalar_words = scalar_words
         self.changed = False
 
     def watch(self, key, operand):
@@ -289,6 +309,14 @@ class ComparisonTransform(ast.NodeTransformer):
             node.slice = self.watch('lookup:' + word, node.slice)
         return node
 
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load) and node.attr in self.scalar_words:
+            node.value = ast.copy_location(ast.Call(ast.Name('_blast_scalar', ast.Load()),
+                [node.value, ast.Constant(node.attr)], []), node.value)
+            self.changed = True
+        return node
+
     def visit_Compare(self, node):
         self.generic_visit(node)
         if description := describe(node):
@@ -309,38 +337,47 @@ class ComparisonTransform(ast.NodeTransformer):
 
 
 class ComparisonSource(importlib.machinery.SourceFileLoader):
-    def __init__(self, original, path, observers, lookups):
+    def __init__(self, original, path, observers, lookups, tracer):
         super().__init__(original.name, original.path)
         self.relative_path = path
         self.observers = observers
         self.lookups = lookups
+        self.tracer = tracer
 
     def exec_module(self, module):
         module.__dict__.update(self.observers)
-        super().exec_module(module)
+        self.tracer.import_depth += 1
+        try:
+            super().exec_module(module)
+        finally:
+            self.tracer.import_depth -= 1
 
     def get_code(self, fullname):
         data = self.get_data(self.path)
-        if self.lookups or any(op in data for op in (b' is ', b'==', b'!=', b'<', b'>', b' in ')):
-            tree = ast.parse(data, self.path)
-            transformer = ComparisonTransform(self.relative_path, self.lookups)
-            transformer.visit(tree)
-            if transformer.changed:
-                return compile(ast.fix_missing_locations(tree), self.path, 'exec', dont_inherit=True)
-        return super().get_code(fullname)
+        tree = ast.parse(data, self.path)
+        # Bind callbacks before rewriting expressions so their source positions
+        # and factory identities refer to the untouched baseline.
+        DispatchTransform(self.relative_path).visit(tree)
+        ComparisonTransform(self.relative_path, self.lookups, self.tracer.dispatch.words).visit(tree)
+        BranchTransform(self.relative_path, self.tracer).visit(tree)
+        return compile(ast.fix_missing_locations(tree), self.path, 'exec', dont_inherit=True)
 
 
 class ComparisonFinder(importlib.machinery.PathFinder):
     def __init__(self, tracer, flows):
         self.tracer = tracer
-        self.observations = defaultdict(dict)
+        self.observations = defaultdict(lambda: defaultdict(set))
         self.operands = defaultdict(dict)
         self.flows = flows
         self.lookups = defaultdict(set)
         for word, paths in flows.items():
             for path in paths:
                 self.lookups[path].add(word)
-        self.observers = {'_blast_sample_compare': self.observe,
+        self.observers = {'_blast_branch_enabled': True,
+                          '_blast_bind_lambda': tracer.dispatch.bind_lambda,
+                          '_blast_bind_factory': tracer.dispatch.bind_factory,
+                          '_blast_scalar': tracer.dispatch.read,
+                          '_blast_sample_compare': self.observe,
                           '_blast_observe_operand': self.observe_operand}
 
     def find_spec(self, fullname, path=None, target=None):
@@ -350,21 +387,24 @@ class ComparisonFinder(importlib.machinery.PathFinder):
         if spec and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
             relative = self.tracer.relative(spec.origin)
             if relative:
-                spec.loader = ComparisonSource(spec.loader, relative, self.observers, self.lookups.get(relative, ()))
+                spec.loader = ComparisonSource(spec.loader, relative, self.observers, self.lookups.get(relative, ()), self.tracer)
         return spec
 
     def observe(self, site, left, right, inverted):
         identical = left is right
-        old_result = not identical if inverted else identical
-        contexts = self.observations[site]
-        context = self.tracer.context
-        if contexts.get(context) is not False:
-            safe = pure_equality(type(left)) and pure_equality(type(right))
-            if safe:
-                new_result = left != right if inverted else left == right
-                safe = new_result is old_result
-            contexts[context] = safe
-        return old_result
+        if left is None or right is None:
+            kind = type(right) if left is None else type(left)
+            relation = ('identical' if identical else
+                        'distinct' if distinct_from_none(kind) else 'unknown')
+        elif pure_equality(type(left)) and pure_equality(type(right)):
+            if left == right:
+                relation = 'identical' if identical else 'equal_distinct'
+            else:
+                relation = 'nonreflexive' if identical else 'distinct'
+        else:
+            relation = 'unknown'
+        self.observations[site][relation].add('' if self.tracer.import_depth else self.tracer.context)
+        return not identical if inverted else identical
 
     def observe_operand(self, site, value):
         contexts = self.operands[site]
@@ -389,6 +429,18 @@ def pure_equality(kind):
     builtins = (object, str, bytes, int, float, type(None))
     return (type.__getattribute__(kind, '__eq__') in {base.__eq__ for base in builtins}
             and type.__getattribute__(kind, '__ne__') in {base.__ne__ for base in builtins})
+
+
+@lru_cache(maxsize=None)
+def distinct_from_none(kind):
+    if pure_equality(kind) or kind in (list, tuple, dict, set, frozenset, bytearray, complex, range):
+        return True
+    # The pinned Expr comparison returns False for unlike concrete types
+    # before hashing. Verify both inherited implementations by identity.
+    core = sys.modules.get('sqlglot.expressions.core')
+    expr = getattr(core, 'Expression', None)
+    return (expr is not None and type.__getattribute__(kind, '__eq__') is expr.__eq__
+            and type.__getattribute__(kind, '__ne__') is expr.__ne__)
 
 
 def symbol_groups(root, files):
@@ -475,11 +527,12 @@ def save_map(output, tracer, plugin, finder):
         'status': plugin.status,
         'collection_errors': plugin.collection_errors,
         'symbols': symbol_groups(Path.cwd(), lines),
-        'comparisons': {site: [group(name for name, safe in contexts.items() if safe),
-                               group(name for name, safe in contexts.items() if not safe)]
-                        for site, contexts in sorted(finder.observations.items())},
+        'relations': {site: {relation: group(names) for relation, names in values.items()}
+                      for site, values in finder.observations.items()},
         'operands': {site: operand_groups(contexts) for site, contexts in sorted(finder.operands.items())},
         'dictionary_values': finder.flows,
+        'dispatch': {site: group(names) for site, names in tracer.dispatch.hits.items()},
+        'branches': {site: group(names) for site, names in tracer.branch_hits.items()},
         'executor_checkpoints': {name: {'plans': {index: sorted(keys) for index, keys in plugin.checkpoints[name].items()},
                                        'reference_sql': plugin.reference_sql[name]}
                                  for name in sorted(executor_tests)},
@@ -500,6 +553,7 @@ def main():
     sys.path.insert(0, str(root))
     os.environ.update(SKIP_INTEGRATION='0', PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
     tracer = LineTrace(root)
+    tracer.dispatch = DispatchProfile(tracer, scalar_inventory(root))
     comparison_finder = ComparisonFinder(tracer, find_flows(root))
     sys.meta_path.insert(0, comparison_finder)
     plugin = Dependencies(root, tracer)
