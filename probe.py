@@ -54,6 +54,12 @@ class Results(unittest.TestResult):
         self.complete = True
         self.cases = cases
         self.current = None
+        self.failfast = True
+
+    def stop(self):
+        # unittest still stops each failed subtest method, while the other
+        # methods in this replay can run and report their own outcomes.
+        pass
 
     def startTest(self, test):
         super().startTest(test)
@@ -100,9 +106,9 @@ def use_checkpoints(checkpoints, results):
 
     def cached(executor, plan, outer_scope=None):
         entries = checkpoints.get(results.current)
-        if entries is None or outer_scope is not None:
+        if entries is None:
             return ordinary(executor, plan, outer_scope)
-        if checkpoint_key(executor, plan) not in entries['plans']:
+        if outer_scope is not None or checkpoint_key(executor, plan) not in entries['plans']:
             raise UnmatchedCheckpoint('changed executor inputs require the original test')
         return True
 
@@ -111,6 +117,12 @@ def use_checkpoints(checkpoints, results):
         cls.tpcds_tables = {table: Table(columns) for table, columns in test_executor.TPCDS_SCHEMA.items()}
         cls.tpch_sqls = list(test_executor.load_sql_fixture_pairs('optimizer/tpc-h/tpc-h.sql'))
         cls.tpcds_sqls = list(test_executor.load_sql_fixture_pairs('optimizer/tpc-ds/tpc-ds.sql'))
+        for name, entries in checkpoints.items():
+            if 'cases' not in entries:
+                continue
+            field = name.rsplit('test_execute_', 1)[1] + '_sqls'
+            queries = getattr(cls, field)
+            setattr(cls, field, [queries[index] for index in entries['cases']])
 
     def check(self, index, table, tpch=True):
         _, sql, _ = (self.tpch_sqls if tpch else self.tpcds_sqls)[index]
@@ -137,6 +149,9 @@ def main():
 
     with open(os.devnull, 'w', encoding='utf-8') as sink, contextlib.redirect_stdout(sink):
         cases = unit_tests(request['tests'])
+        optimizer_tests = sys.modules.get('tests.test_optimizer')
+        if optimizer_tests is not None:
+            optimizer_tests.ProcessPoolExecutor = InlineExecutor
         results = Results(cases)
         if checkpoints := request.get('checkpoints'):
             use_checkpoints(checkpoints, results)
