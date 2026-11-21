@@ -158,10 +158,8 @@ def use_checkpoints(checkpoints, results):
     PythonExecutor.execute = cached
 
 
-def main():
+def execute_request(root, request):
     started = time.process_time()
-    root = Path(sys.argv[1])
-    request = json.load(sys.stdin)
     os.chdir(root)
     sys.path.insert(0, str(root))
     sys.meta_path.insert(0, Overlay(root, request['files']))
@@ -180,9 +178,8 @@ def main():
         except UnmatchedCheckpoint:
             pass
     passed = sorted(cases[test] for test in results.passed) if results.complete else []
-    print(json.dumps({'passed': passed,
-                      'cpu_seconds': time.process_time() - started}))
+    return {'passed': passed, 'cpu_seconds': time.process_time() - started}
 
 
 if __name__ == '__main__':
-    main()
+    print(json.dumps(execute_request(Path(sys.argv[1]), json.load(sys.stdin))))

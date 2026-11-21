@@ -11,7 +11,7 @@ COPY requirements.txt /app/
 RUN python -m pip install --disable-pip-version-check --no-cache-dir --prefix=/install -r requirements.txt
 
 ENV PYTHONPATH=/install/lib/python3.13/site-packages
-COPY collect.py comparisons.py operands.py replay_cache.py mapflow.py /app/
+COPY collect.py comparisons.py operands.py replay_cache.py mapflow.py dispatch.py branches.py /app/
 RUN python -m compileall -q /app/source/sqlglot /app/source/tests \
     && python /app/collect.py /app/source /app/coverage.json.gz
 
@@ -22,6 +22,6 @@ WORKDIR /app
 COPY --from=build /install/ /usr/local/
 COPY --from=build /app/source/ /app/source/
 COPY --from=build /app/coverage.json.gz /app/
-COPY selector.py patches.py probe.py comparisons.py operands.py replay_cache.py mapflow.py declarations.py /app/
+COPY selector.py patches.py probe.py comparisons.py operands.py replay_cache.py mapflow.py declarations.py dispatch.py branches.py /app/
 USER 65534:65534
 ENTRYPOINT ["python", "/app/selector.py"]

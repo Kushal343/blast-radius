@@ -2,18 +2,24 @@
 
 import argparse
 import ast
+import bisect
 import gzip
 import json
+import multiprocessing
+import os
 import re
 import subprocess
 import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
+from branches import edited_branches
 from comparisons import equality_edits, site_for
 from declarations import default_edits
+from dispatch import changed_sites
 from mapflow import dict_value_edits
 from operands import edited_predicates, same_result, unpack
 from patches import read_patch
@@ -37,23 +43,32 @@ class Statement:
     last: int
 
 
-def statements_by_line(tree):
+def statements_by_line(tree, wanted=None):
     index = {}
+    wanted = sorted(wanted) if wanted is not None else None
+
+    def relevant(start, stop):
+        if wanted is None:
+            return range(start, stop + 1)
+        return wanted[bisect.bisect_left(wanted, start):bisect.bisect_right(wanted, stop)]
 
     def walk(node, classes=(), functions=()):
         if isinstance(node, ast.Lambda):
             body = node.body
             first = max(node.lineno + 1, body.lineno)
             statement = Statement(body, True, classes, functions, body.lineno, body.end_lineno)
-            for line in range(first, body.end_lineno + 1):
+            for line in relevant(first, body.end_lineno):
                 index[line] = statement
             return
         if isinstance(node, ast.stmt):
             first = min([node.lineno, *(n.lineno for n in getattr(node, 'decorator_list', ()))])
+            selected = relevant(first, node.end_lineno)
+            if not selected:
+                return
             children = [c.lineno for c in ast.iter_child_nodes(node) if isinstance(c, ast.stmt)]
             last = min(children) if children else node.end_lineno
             statement = Statement(node, bool(functions), classes, functions, first, last)
-            for line in range(first, node.end_lineno + 1):
+            for line in selected:
                 index[line] = statement
         nested_classes = (*classes, node.name) if isinstance(node, ast.ClassDef) else classes
         nested_functions = (*functions, node.name) if isinstance(node, FUNCTIONS) else functions
@@ -97,18 +112,25 @@ class Selector:
         for number, record in self.catalog.items():
             self.by_file[record['file']].add(number)
         measured = artifact['tests']
-        self.groups = [frozenset(self.by_name[measured[i]] for i in group if measured[i] in self.by_name)
-                       for group in artifact['groups']]
-        self.initialization = {i for i, group in enumerate(artifact['groups'])
-                               if any(not measured[member] for member in group)}
+        numbers = [self.by_name.get(name) for name in measured]
+        self.groups = CatalogGroups(artifact['groups'], numbers)
+        initial = measured.index('') if '' in measured else -1
+        self.initialization = {i for i, group in enumerate(artifact['groups']) if initial in group}
         self.lines = {name: {int(line): group for line, group in lines.items()}
                       for name, lines in artifact['lines'].items()}
         self.readers = artifact['files']
         self.dialects = artifact['dialects']
         self.symbol_groups = artifact.get('symbols')
         self.comparisons = artifact.get('comparisons', {})
+        self.relations = artifact.get('relations', {})
         self.operands = artifact.get('operands', {})
         self.dictionary_values = artifact.get('dictionary_values', {})
+        self.dispatch = artifact.get('dispatch', {})
+        self.branches = artifact.get('branches', {})
+        self.dispatch_lines = defaultdict(set)
+        for location in self.dispatch:
+            path, line, _ = location.rsplit(':', 2)
+            self.dispatch_lines[path].add(int(line))
         self.checkpoints = artifact.get('executor_checkpoints', {})
         self.executor_lines = {name: {path: set(lines) for path, lines in files.items()}
                                for name, files in artifact.get('executor_lines', {}).items()}
@@ -199,7 +221,7 @@ class Selector:
         return {number for number in self.by_file[path]
                 if (test_id := self.catalog[number]['id']) == prefix or test_id.startswith(prefix + '[')}
 
-    def python_tests(self, change, replacements, equality_sites, predicates, body_edits, dictionaries):
+    def python_tests(self, change, replacements, equality_sites, predicates, body_edits, dictionaries, bounds):
         path = change.path
         if change.before != change.after or not change.hunks:
             return self.by_file[path] if path in self.by_file else self.all
@@ -216,16 +238,29 @@ class Selector:
             compile(new_tree, path, 'exec')
         except (SyntaxError, ValueError):
             return self.by_file[path] if path in self.by_file else self.all
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        focus = changed_statement(old_tree, new_tree)
+        if focus is None:
             return direct_readers
 
         replacements[path] = after
-        if self.comparisons and path.startswith('sqlglot/'):
-            equality_sites[path] = equality_edits(path, old_tree, new_tree)
+        if self.branches:
+            guards = edited_branches(path, *focus, self.branches)
+            if guards and all(self.branches[key] not in self.initialization for key in guards):
+                bounds.append(set(direct_readers).union(self.external, self.unmeasured,
+                    *(self.groups[self.branches[key]] for key in guards)))
+        if self.dispatch_lines[path] and any(
+                stmt and any(stmt.first <= line <= stmt.node.end_lineno for line in self.dispatch_lines[path])
+                for stmt in (old_index.get(n) for n in removed)):
+            sites = changed_sites(path, *focus, self.dispatch)
+            if sites and all(self.dispatch[key] not in self.initialization for key in sites):
+                bounds.append(set(direct_readers).union(self.external, self.unmeasured,
+                    *(self.groups[self.dispatch[key]] for key in sites)))
+        if (self.comparisons or self.relations) and path.startswith('sqlglot/'):
+            equality_sites[path] = equality_edits(path, *focus)
         if self.operands and path.startswith('sqlglot/'):
-            predicates[path] = edited_predicates(path, old_tree, new_tree, site_for)
+            predicates[path] = edited_predicates(path, *focus, site_for)
 
-        new_index = statements_by_line(new_tree)
+        new_index = statements_by_line(new_tree, added)
         if path.startswith('sqlglot/') and any(isinstance(old_index[line].node, FUNCTIONS)
                                                 for line in removed if line in old_index):
             defaults = default_edits(old_tree, new_tree)
@@ -241,7 +276,7 @@ class Selector:
                     return calls
         if any(name.lower() in self.dictionary_values for line in removed if line in old_index
                for name in bindings(old_index[line].node)):
-            dictionaries[path] = dict_value_edits(old_tree, new_tree)
+            dictionaries[path] = dict_value_edits(*focus)
         tests = set(direct_readers)
         initialization = set()
         affected_lines = set()
@@ -338,8 +373,10 @@ class Selector:
                         prefix = path.removesuffix('conftest.py')
                         tests.update(number for number, t in self.catalog.items() if t['file'].startswith(prefix))
                 if change.path and change.path.endswith('.py') and change.path.startswith(('sqlglot/', 'tests/')):
-                    tests.update(self.python_tests(change, replacements, equality_sites, predicates,
-                                                   body_edits, dictionaries))
+                    bounds = []
+                    affected = self.python_tests(change, replacements, equality_sites, predicates,
+                                                 body_edits, dictionaries, bounds)
+                    tests.update(affected.intersection(*bounds) if bounds else affected)
         except (OSError, UnicodeError, SyntaxError, ValueError) as error:
             print(f'{patch.name}: {error}', file=sys.stderr)
             return self.all, {}, {}
@@ -379,6 +416,15 @@ class Selector:
 
     def unchanged_comparisons(self, tests, identity, predicates):
         affected = set()
+        if identity and identity <= self.relations.keys():
+            for site in identity:
+                for relation, group in self.relations[site].items():
+                    if relation in ('identical', 'distinct'):
+                        continue
+                    if group in self.initialization:
+                        return set()
+                    affected.update(self.groups[group])
+            return tests - affected
         if identity and identity <= self.comparisons.keys():
             for site in identity:
                 _, uncertain = self.comparisons[site]
@@ -403,21 +449,24 @@ class Selector:
         return tests - affected
 
     def run_probe(self, replacements, names, timeout, checkpoints=None):
-        request = json.dumps({'files': replacements, 'tests': names, 'checkpoints': checkpoints})
+        request = {'files': replacements, 'tests': names, 'checkpoints': checkpoints}
         try:
-            process = subprocess.run(
-                [sys.executable, str(Path(__file__).with_name('probe.py')), str(self.root)],
-                input=request, encoding='utf-8', stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=timeout, check=True,
-            )
-            result = json.loads(process.stdout)
+            if sys.platform == 'linux':
+                result = fork_probe(self.root, request, timeout)
+            else:
+                process = subprocess.run(
+                    [sys.executable, str(Path(__file__).with_name('probe.py')), str(self.root)],
+                    input=json.dumps(request), encoding='utf-8', stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=timeout, check=True,
+                )
+                result = json.loads(process.stdout)
             self.probe_cpu += result['cpu_seconds']
             return {self.by_name[name] for name in result['passed'] if name in self.by_name}
         except subprocess.TimeoutExpired:
             # Windows has no RUSAGE_CHILDREN. Charge the timeout conservatively there.
             self.probe_cpu += timeout
             return set()
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except (EOFError, OSError, ValueError, subprocess.SubprocessError):
             return set()
 
     def eligible_executor_cases(self, tests, body_edits):
@@ -446,7 +495,7 @@ class Selector:
             eligible = {self.by_name[name] for name in cache}
             case_count = sum(len(item['cases']) for item in cache.values())
             if (eligible and scheduled_cost(tests, durations) - scheduled_cost(tests - eligible, durations)
-                    > 2500 + 100 * case_count):
+                    > 4500 + 150 * case_count):
                 names = sorted(cache, key=lambda name: len(cache[name]['cases']))
                 tests = tests - (eligible & self.run_probe(replacements, names, min(5, remaining), cache))
                 remaining = self.probe_deadline - time.monotonic()
@@ -457,7 +506,7 @@ class Selector:
         protected.update(*(self.file_tests(path) for path in replacements))
         candidates = tests - protected
         expected = sum(durations[number] for number in candidates)
-        if len(candidates) < 2 or expected > 2000:
+        if not candidates or expected > 2000:
             return tests
         retained = tests & protected
         if retained:
@@ -466,6 +515,37 @@ class Selector:
                 return tests
         names = [self.catalog[number]['id'] for number in sorted(candidates)]
         return tests - (candidates & self.run_probe(replacements, names, min(4, remaining)))
+
+
+def fork_worker(output, root, request):
+    from probe import execute_request
+
+    with output, open(os.devnull, 'w') as sink:
+        os.dup2(sink.fileno(), 1)
+        os.dup2(sink.fileno(), 2)
+        output.send(execute_request(root, request))
+
+
+def fork_probe(root, request, timeout):
+    # Preload third-party dependencies once. Each child imports SQLGlot and
+    # the tests from scratch, after installing its own private patch overlay.
+    if any(name.startswith(('tests/test_optimizer.py', 'tests/test_executor.py')) for name in request['tests']):
+        import pandas.testing
+    ctx = multiprocessing.get_context('fork')
+    reader, writer = ctx.Pipe(duplex=False)
+    child = ctx.Process(target=fork_worker, args=(writer, root, request))
+    with reader, writer:
+        child.start()
+        writer.close()
+        try:
+            if reader.poll(timeout):
+                return reader.recv()
+            return {'passed': [], 'cpu_seconds': 0}
+        finally:
+            if child.is_alive():
+                child.kill()
+            child.join()
+            child.close()
 
 
 def schedule(numbers, durations):
@@ -494,6 +574,41 @@ def schedule(numbers, durations):
 def scheduled_cost(numbers, durations):
     workers = schedule(numbers, durations)
     return 2000 * len(workers) + max((sum(durations[num] for num in worker) for worker in workers), default=0)
+
+
+class CatalogGroups:
+    def __init__(self, groups, numbers):
+        self.groups = groups
+        self.numbers = numbers
+
+    @lru_cache(maxsize=None)
+    def __getitem__(self, group):
+        return frozenset(n for i in self.groups[group] if (n := self.numbers[i]) is not None)
+
+
+def changed_statement(before, after):
+    """Find a statement containing every AST difference, or use the whole module."""
+    whole = (before, after)
+    focus = None
+    pairs = [(before, after, whole)]
+    while pairs:
+        a, b, parent = pairs.pop()
+        if type(a) is type(b):
+            if isinstance(a, ast.AST):
+                if isinstance(a, ast.stmt):
+                    parent = (a, b)
+                pairs.extend((getattr(a, f), getattr(b, f), parent) for f in a._fields)
+                continue
+            if isinstance(a, list):
+                if len(a) == len(b):
+                    pairs.extend((x, y, parent) for x, y in zip(a, b))
+                    continue
+            elif a == b and (not isinstance(a, (float, complex)) or repr(a) == repr(b)):
+                continue
+        if focus is not None and focus != parent:
+            return whole
+        focus = parent
+    return focus
 
 
 def main():

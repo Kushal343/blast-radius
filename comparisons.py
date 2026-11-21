@@ -6,9 +6,8 @@ import ast
 def eligible(node):
     return (isinstance(node, ast.Compare) and len(node.ops) == 1
             and isinstance(node.ops[0], (ast.Is, ast.IsNot))
-            and isinstance(node.left, ast.Attribute)
-            and isinstance(node.left.value, ast.Name) and node.left.value.id == 'self'
-            and isinstance(node.comparators[0], (ast.Constant, ast.Attribute)))
+            and (isinstance(node.comparators[0], (ast.Constant, ast.Attribute))
+                 or isinstance(node.left, ast.Constant)))
 
 
 def site_for(path, node):

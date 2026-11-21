@@ -6,6 +6,8 @@ The selector applies each diff to the pinned source in memory. Changes inside fu
 
 When the potential savings justify replay, an isolated Python process reruns a small set of compatible `unittest` cases with the patched library modules in memory. For eligible executor tests, replay compares regenerated execution plans and reference SQL for the affected queries on unchanged fixture inputs. Any changed plan, affected executor code, or incomplete result keeps the test selected. Replay has per-patch and batch time limits. The scheduler compares worker counts from one to eight using integer milliseconds and includes each worker’s two-second overhead.
 
+The build also measures which tests enter individual conditional operands, invoke callbacks stored in dispatch dictionaries, and read inherited scalar class settings. Each closure created by an eligible factory gets its own profiling identity. The selector checks the complete syntax-tree difference before using those measurements. On Linux, replay workers inherit preloaded third-party dependencies and load the patched SQLGlot library in a fresh child process.
+
 ## Local benchmark
 
 The default Docker build regenerates all profiles from the pinned revision in the scorer’s Linux base image. The bundled map supports local development. The selector reads only the patch and test catalog inputs during scoring.
